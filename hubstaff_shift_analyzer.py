@@ -90,7 +90,26 @@ def _to_naive_datetime_series(series: pd.Series) -> pd.Series:
     return parsed
 
 
-def extract_start_stop(df: pd.DataFrame) -> tuple[list, list]:
+def parse_activity_to_percent(series: pd.Series) -> pd.Series:
+    """Normalize the Activity column to a 0-100 percent scale regardless
+    of how this export represents it. Three formats have been seen for
+    this field in practice: a 0-1 fraction ('0.69'), a literal percent
+    string ('69%'), or a plain 0-100 number ('69'). Detect which one this
+    file uses instead of assuming the xlsx-derived 0-1 fraction shape."""
+    raw = series.astype(str).str.strip()
+    has_percent_sign = raw.str.contains("%", regex=False).any()
+    numeric = pd.to_numeric(raw.str.rstrip("%"), errors="coerce")
+
+    if has_percent_sign:
+        pct = numeric  # e.g. "69%" -> 69, already on a 0-100 scale
+    else:
+        non_null_max = numeric.dropna().max() if numeric.notna().any() else 0.0
+        if non_null_max <= 1.5:
+            pct = numeric * 100.0  # fraction scale, e.g. 0.69 -> 69.0
+        else:
+            pct = numeric  # already 0-100, e.g. 69 -> 69
+
+    return pct.fillna(0.0)
     """Two Hubstaff export shapes have been seen in practice:
       1. xlsx-style: a bare date in 'Start'/'Stop' plus the time-of-day
          (with timezone offset) in separate 'Start Time'/'Stop Time' columns.
@@ -152,7 +171,7 @@ def load_and_process(
         )
 
     df["duration_hours"] = (df["stop_dt"] - df["start_dt"]).dt.total_seconds() / 3600.0
-    df["Activity"] = pd.to_numeric(df["Activity"], errors="coerce").fillna(0.0)
+    df["Activity"] = parse_activity_to_percent(df["Activity"])
 
     summary_rows = []
     detail_frames = []
@@ -187,7 +206,7 @@ def load_and_process(
                     "Target Hours": daily_target_hours,
                     "Shortfall (hrs)": round(max(0.0, daily_target_hours - total_hours), 2),
                     "Meets Target": "Yes" if total_hours >= daily_target_hours else "No",
-                    "Avg Efficiency %": round(weighted_efficiency * 100, 1),
+                    "Avg Efficiency %": round(weighted_efficiency, 1),
                     "Entries": len(sg),
                 }
             )
