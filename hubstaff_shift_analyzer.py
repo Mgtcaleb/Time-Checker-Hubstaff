@@ -6,10 +6,13 @@ Run with:
     pip install streamlit pandas openpyxl altair
     streamlit run hubstaff_shift_analyzer.py
 
-Upload a Hubstaff "timesheet report" .xlsx export (the format that has
-columns: Member, Organization, Time Zone, Projects, Task Summary, Start,
-Start Time, Stop, Stop Time, Duration, Activity, Idle, Manual, Notes,
-Reasons, Type, Payment type).
+Upload a Hubstaff "timesheet report" export, .xlsx or .csv (the format
+that has columns: Member, Organization, Time Zone, Projects, Task
+Summary, Start, Start Time, Stop, Stop Time, Duration, Activity, Idle,
+Manual, Notes, Reasons, Type, Payment type). The CSV path assumes the
+same column layout as the xlsx export — if Hubstaff's CSV export uses
+different column names, the column-check error below will say exactly
+which ones are missing.
 
 WHAT COUNTS AS A "SHIFT" / "WORK DAY"
 --------------------------------------
@@ -47,7 +50,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Hubstaff Shift & Efficiency Analyzer", layout="wide")
 
-REQUIRED_COLUMNS = {"Member", "Start", "Start Time", "Stop", "Stop Time", "Activity"}
+REQUIRED_COLUMNS = {"Member", "Start", "Stop", "Activity"}
 
 
 # --------------------------------------------------------------------------
@@ -72,9 +75,63 @@ def parse_local_dt(date_val, time_str) -> dt.datetime | None:
     return dt.datetime.combine(base_date, dt.time(h, m, s))
 
 
+def _to_naive_datetime_series(series: pd.Series) -> pd.Series:
+    """Parse a column that already holds a full date+time value in one
+    cell (as opposed to a bare date paired with a separate time column).
+    Handles both timezone-aware strings (e.g. '2026-09-16 17:37:22+05:30')
+    and plain ones, and strips any timezone so hour arithmetic stays in
+    local wall-clock time, consistent with the split-column path above."""
+    parsed = pd.to_datetime(series, errors="coerce", utc=False)
+    try:
+        if parsed.dt.tz is not None:
+            parsed = parsed.dt.tz_localize(None)
+    except (TypeError, AttributeError):
+        pass
+    return parsed
+
+
+def extract_start_stop(df: pd.DataFrame) -> tuple[list, list]:
+    """Two Hubstaff export shapes have been seen in practice:
+      1. xlsx-style: a bare date in 'Start'/'Stop' plus the time-of-day
+         (with timezone offset) in separate 'Start Time'/'Stop Time' columns.
+      2. csv-style: a single 'Start'/'Stop' column already holding the
+         full timestamp.
+    Detect which shape this file is and parse accordingly, so both work
+    without the user needing to tell us which export type it is."""
+    if {"Start Time", "Stop Time"}.issubset(df.columns):
+        start_dt = [parse_local_dt(d, t) for d, t in zip(df["Start"], df["Start Time"])]
+        stop_dt = [parse_local_dt(d, t) for d, t in zip(df["Stop"], df["Stop Time"])]
+    else:
+        start_dt = list(_to_naive_datetime_series(df["Start"]))
+        stop_dt = list(_to_naive_datetime_series(df["Stop"]))
+    return start_dt, stop_dt
+
+
+def _read_table(file_bytes: bytes, file_ext: str) -> pd.DataFrame:
+    """Read either a Hubstaff .xlsx or .csv export into a DataFrame.
+    CSV encoding isn't guaranteed, so fall back through a couple of common
+    ones rather than failing outright on the first mismatch."""
+    if file_ext == "xlsx":
+        return pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
+
+    if file_ext == "csv":
+        last_error = None
+        for encoding in ("utf-8-sig", "utf-8", "latin1"):
+            try:
+                return pd.read_csv(io.BytesIO(file_bytes), encoding=encoding)
+            except UnicodeDecodeError as exc:
+                last_error = exc
+                continue
+        raise ValueError(f"Could not decode this CSV file (tried utf-8/latin1): {last_error}")
+
+    raise ValueError(f"Unsupported file type: .{file_ext}")
+
+
 @st.cache_data(show_spinner=False)
-def load_and_process(file_bytes: bytes, daily_target_hours: float, shift_gap_hours: float):
-    df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
+def load_and_process(
+    file_bytes: bytes, file_ext: str, daily_target_hours: float, shift_gap_hours: float
+):
+    df = _read_table(file_bytes, file_ext)
 
     missing = REQUIRED_COLUMNS - set(df.columns)
     if missing:
@@ -83,11 +140,16 @@ def load_and_process(file_bytes: bytes, daily_target_hours: float, shift_gap_hou
             f"{', '.join(sorted(missing))}"
         )
 
-    df["start_dt"] = [parse_local_dt(d, t) for d, t in zip(df["Start"], df["Start Time"])]
-    df["stop_dt"] = [parse_local_dt(d, t) for d, t in zip(df["Stop"], df["Stop Time"])]
+    start_dt, stop_dt = extract_start_stop(df)
+    df["start_dt"] = start_dt
+    df["stop_dt"] = stop_dt
     df = df.dropna(subset=["start_dt", "stop_dt"]).copy()
     if df.empty:
-        raise ValueError("No rows with parseable Start/Stop times were found.")
+        raise ValueError(
+            "No rows with parseable Start/Stop times were found. This file's "
+            "date/time format may differ from the ones this tool has been tested "
+            "against — send a couple of sample rows so the parser can be adjusted."
+        )
 
     df["duration_hours"] = (df["stop_dt"] - df["start_dt"]).dt.total_seconds() / 3600.0
     df["Activity"] = pd.to_numeric(df["Activity"], errors="coerce").fillna(0.0)
@@ -162,15 +224,19 @@ with st.sidebar:
         "larger than this counts as the start of the next day's shift.",
     )
 
-uploaded = st.file_uploader("Upload Hubstaff timesheet report (.xlsx)", type=["xlsx"])
+uploaded = st.file_uploader(
+    "Upload Hubstaff timesheet report (.xlsx or .csv)", type=["xlsx", "csv"]
+)
 
 if uploaded is None:
-    st.info("Waiting for a .xlsx file.")
+    st.info("Waiting for a .xlsx or .csv file.")
     st.stop()
+
+file_ext = uploaded.name.rsplit(".", 1)[-1].lower()
 
 try:
     summary_df, detail_df = load_and_process(
-        uploaded.getvalue(), daily_target_hours, shift_gap_hours
+        uploaded.getvalue(), file_ext, daily_target_hours, shift_gap_hours
     )
 except Exception as exc:  # noqa: BLE001 - surface any parsing problem to the user
     st.error(str(exc))
