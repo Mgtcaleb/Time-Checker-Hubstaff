@@ -110,6 +110,9 @@ def parse_activity_to_percent(series: pd.Series) -> pd.Series:
             pct = numeric  # already 0-100, e.g. 69 -> 69
 
     return pct.fillna(0.0)
+
+
+def extract_start_stop(df: pd.DataFrame) -> tuple[list, list]:
     """Two Hubstaff export shapes have been seen in practice:
       1. xlsx-style: a bare date in 'Start'/'Stop' plus the time-of-day
          (with timezone offset) in separate 'Start Time'/'Stop Time' columns.
